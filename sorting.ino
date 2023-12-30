@@ -1,11 +1,29 @@
-#include <MD_TCS230.h>
-#include <FreqCount.h>
-
 #include <Wire.h>
-#include <Adafruit_MotorShield.h>
+#include "Adafruit_TCS34725.h"  //color sensor
 
-Adafruit_MotorShield AFMS = Adafruit_MotorShield();
-Adafruit_DCMotor motor[3] = { *AFMS.getMotor(1), *AFMS.getMotor(2), *AFMS.getMotor(3) };
+#include <MX1508.h>
+uint8_t searchAddress = 0x29;   //  i2c address
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_614MS, TCS34725_GAIN_1X);
+const int colorIntPin = A3;
+volatile boolean colorint = true;
+volatile boolean topint = false;
+volatile boolean botint = false;
+volatile uint8_t prevValue = 0;
+
+
+#define NUM_MOTORS 3
+#define B_PINA 3
+#define B_PINB 5
+#define C_PINA 6
+#define C_PINB 9
+#define A_PINA 10
+#define A_PINB 11
+MX1508 motor[NUM_MOTORS] = {
+  MX1508(A_PINA, A_PINB),
+  MX1508(B_PINA, B_PINB),
+  MX1508(C_PINA, C_PINB)
+};
+
 
 #define UINT32_MAX 0xFFFFFFFF
 
@@ -17,7 +35,13 @@ Adafruit_DCMotor motor[3] = { *AFMS.getMotor(1), *AFMS.getMotor(2), *AFMS.getMot
     Serial.print(F(s)); \
     Serial.print(v); \
   }
+#define DUMPBIN(s, v) \
+  { \
+    Serial.print(F(s)); \
+    Serial.print(v,BIN); \
+  }  
 #define DUMPS(s) Serial.print(F(s))
+#define DUMPSLN(s) Serial.println(F(s))
 #else
 #define DUMP(s, v)
 #define DUMPS(s)
@@ -28,7 +52,8 @@ Adafruit_DCMotor motor[3] = { *AFMS.getMotor(1), *AFMS.getMotor(2), *AFMS.getMot
 #define BOTDISK 1
 #define HOLE false
 #define SPACE true
-
+#define FORWARD 1
+#define BACKWARD 0
 
 #define BLACK_CAL 0
 #define WHITE_CAL 1
@@ -36,7 +61,7 @@ Adafruit_DCMotor motor[3] = { *AFMS.getMotor(1), *AFMS.getMotor(2), *AFMS.getMot
 
 #define NUM_COLORS 5
 #define NUM_RGB 3
-uint32_t skittles[NUM_COLORS][NUM_RGB] = {
+uint8_t skittles[NUM_COLORS][NUM_RGB] = {
   { 0, 0, 0 },
   { 0, 0, 0 },
   { 0, 0, 0 },
@@ -46,22 +71,21 @@ uint32_t skittles[NUM_COLORS][NUM_RGB] = {
 
 float scale_factor[NUM_RGB] = { 0.0, 0.0, 0.0 };
 
-// Interrupt definitions
-#define TOPDISK_INT 0
-#define BOTDISK_INT 1
+// Interrupt definitions, D2 and D4
+#define TOPDISK_INT 4
+#define BOTDISK_INT 2
 
 // Pin definitions
-#define S0_OUT 8
-#define S1_OUT 9
-#define S2_OUT 10
-#define S3_OUT 11
-#define TOPDISK_PIN 2
-#define BOTDISK_PIN 3
-#define TRIPWIRE_PIN 4
-#define RED_BUTTON 13
-#define GREEN_BUTTON 12
+#define COLOR_SENSOR 5
+#define TOPDISK_PIN 4
+#define BOTDISK_PIN 2
+#define TRIPWIRE_PIN A7 //skittle drop
+#define TRIPWIRE_LEDR A0
+#define TRIPWIRE_LEDG A1
+#define TRIPWIRE_LEDB A2
 
-MD_TCS230 CS(S2_OUT, S3_OUT, S0_OUT, S1_OUT);
+#define RED_BUTTON 7
+#define GREEN_BUTTON 8
 
 volatile uint8_t diskDir[2] = { FORWARD, FORWARD };
 volatile uint8_t diskPos[2] = { 0, 0 };
@@ -69,6 +93,35 @@ volatile uint8_t targetPos[2] = { 0, 0 };
 
 bool isStop = false;
 bool isInitialized = false;
+
+/* tcs.getRawData() does a delay(Integration_Time) after the sensor readout.
+We don't need to wait for the next integration cycle because we receive an interrupt when the integration cycle is complete*/
+void getRawData_noDelay(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *c)
+{
+  *c = tcs.read8(TCS34725_CDATAL);
+  *r = tcs.read8(TCS34725_RDATAL);
+  *g = tcs.read8(TCS34725_GDATAL);
+  *b = tcs.read8(TCS34725_BDATAL);
+}
+
+void getRGBNormalized(uint8_t *r, uint8_t *g, uint8_t *b)
+{
+  uint8_t red, green, blue, clear;
+  getRawData_noDelay(&red, &green, &blue, &clear);
+
+  uint32_t sum = clear;
+
+  // Avoid divide by zero errors ... if clear = 0 return black
+  if (clear == 0) {
+    *r = *g = *b = 0;
+    return;
+  }
+
+  *r = (float)red / sum * 255.0;
+  *g = (float)green / sum * 255.0;
+  *b = (float)blue / sum * 255.0;
+
+}
 
 void set_abs_pos(uint8_t disk, uint8_t pos) {
   diskPos[disk] = pos;
@@ -94,7 +147,6 @@ bool is_space(uint8_t disk) {
   return ((diskPos[disk] % 2) == 1);
 }
 
-
 void set_abs_target_pos(uint8_t disk, uint8_t pos) {
   targetPos[disk] = pos;
 }
@@ -111,7 +163,6 @@ void add_abs_target_pos(uint8_t disk, int num) {
   targetPos[disk] = mod(targetPos[disk] + num, 10);
 }
 
-
 uint8_t get_target_pos(uint8_t disk) {
   return targetPos[disk] / 2;
 }
@@ -124,8 +175,8 @@ bool is_target(uint8_t disk) {
   return (targetPos[disk] == diskPos[disk]);
 }
 
-
 void top_pos_handler() {
+  DUMPSLN("top_pos_handler");
   int value = digitalRead(TOPDISK_PIN);
 
   if (value) {
@@ -144,6 +195,7 @@ void top_pos_handler() {
 }
 
 void bot_pos_handler() {
+  DUMPSLN("bot_pos_handler");
   int value = digitalRead(BOTDISK_PIN);
 
   if (value) {
@@ -168,26 +220,67 @@ void setup() {
   pinMode(GREEN_BUTTON, INPUT);      // set pin to input
   digitalWrite(GREEN_BUTTON, HIGH);  // turn on pullup resistors
 
+  //Replaced with PCINTs due to limited PWM on the Nano consumes D3 (D2 and D3 are the only HW interrupts)
+  //attachInterrupt(TOPDISK_INT, top_pos_handler, CHANGE);
+  //attachInterrupt(BOTDISK_INT, bot_pos_handler, CHANGE);
 
-  attachInterrupt(TOPDISK_INT, top_pos_handler, CHANGE);
-  attachInterrupt(BOTDISK_INT, bot_pos_handler, CHANGE);
+  pinMode(colorIntPin, INPUT_PULLUP); //TCS interrupt output is Active-LOW and Open-Drain
+  pinMode(TOPDISK_INT, INPUT_PULLUP); //TCS interrupt output is Active-LOW and Open-Drain
+  pinMode(BOTDISK_INT, INPUT_PULLUP); //TCS interrupt output is Active-LOW and Open-Drain
 
-  Serial.begin(115200);
-  DUMPS("Start skittles\n");
+  // https://www.electrosoftcloud.com/en/pcint-interrupts-on-arduino/
+  PCICR |= 0b00000110; // We activate the interrupts of the PC and PD
+  PCMSK1 |= 0b00001000; // Trigger interrupts on pins A3
+  PCMSK2 |= 0b00010100; // Trigger interrupts on pins D2 and D4 for disks
 
-  CS.begin();
+  Serial.begin(38400);
+  DUMPSLN("Start skittles sorter");
 
+  Wire.begin();
 
-  AFMS.begin();  // create with the default frequency 1.6KHz
+  if (tcs.begin()) {
+    DUMPSLN("Initializing color sensor...");
+  } else {
+    DUMPSLN("No TCS34725 found... check your connections");
+    while (1);
+  }  
+  DUMPSLN("i2c success!");
+
+  //finish initilizing the color sensor
+  // Set persistence filter to generate an interrupt for every RGB Cycle, regardless of the integration limits
+  tcs.write8(TCS34725_PERS, TCS34725_PERS_NONE); 
+  tcs.setInterrupt(true);
+  sei();
+
+  delay(100);
+
+}
+void tripOff(){
+  //turn off tripwire led
+  analogWrite(TRIPWIRE_LEDR, 0);
+  analogWrite(TRIPWIRE_LEDG, 0);
+  analogWrite(TRIPWIRE_LEDB, 0);    
+}
+void tripOn(){
+  //turn on tripwire led "white"
+  analogWrite(TRIPWIRE_LEDR, 200);
+  analogWrite(TRIPWIRE_LEDG, 200);
+  analogWrite(TRIPWIRE_LEDB, 200);
 }
 
 void loop() {
   while (isStop) {
-    if (digitalRead(GREEN_BUTTON) == LOW) { isStop = false; }
+    tripOff();
+    if (digitalRead(GREEN_BUTTON) == LOW){
+      isStop = false;
+    }
   }
+
   if (!isInitialized) {
-    calibrate_color();
+    DUMPSLN("Initializing...");
+    calibrate_color();    
     calibrate_positions();
+    DUMPSLN("Initialization Complete!");
   }
 
   drop_skittle();
@@ -207,6 +300,8 @@ void loop() {
 }
 
 void drop_skittle() {
+  DUMPSLN("Dropping skittle...");
+  tripOn();
   if (isStop) { return; }
 
   if (get_abs_pos(BOTDISK) == 7 || get_abs_pos(BOTDISK) == 8) {
@@ -218,31 +313,26 @@ void drop_skittle() {
     go(TOPDISK, FORWARD, 1, HOLE);
   }
 
-  motor[2].setSpeed(255);
-  motor[2].run(FORWARD);
+  motor[2].motorGo(255);
 
   // Wait for Skittle
   unsigned long startTime = millis();
-  while (analogRead(2) < 450) {
+  DUMP("TRIP:", analogRead(TRIPWIRE_PIN));
+  DUMPSLN("");
+  while (analogRead(TRIPWIRE_PIN) > 1200) {
     if (millis() > startTime + 5000) {
-      motor[0].run(RELEASE);
-      motor[1].run(RELEASE);
-      motor[2].run(RELEASE);
+      motor[0].stopMotor();
+      motor[1].stopMotor();
+      motor[2].stopMotor();
       isStop = true;
+      DUMPSLN("TRIPWIRE FAILED!");
       return;
     }
-    if (isStop || digitalRead(RED_BUTTON) == LOW) {
-      motor[0].run(RELEASE);
-      motor[1].run(RELEASE);
-      motor[2].run(RELEASE);
-      isStop = true;
-      isInitialized = false;
-      return;
-    }
+    if (checkStop()) return;
   }
   //while(digitalRead(TRIPWIRE_PIN) == HIGH){ }
-
-  motor[2].run(RELEASE);
+  tripOff();
+  motor[2].stopMotor();
 
   // Wait briefly to make sure skittle has
   // fallen in hole before moving disk
@@ -259,8 +349,7 @@ void move_to_color_sensor() {
 void go_360(int disk, uint8_t dir, bool isSpace) {
   if (isStop) { return; }
 
-  motor[disk].setSpeed(255);
-  runDisk(disk, dir);
+  runDisk(disk, dir, 255);
   for (int i = 0; i < 5; i++) {
     if (dir == FORWARD) {
       set_target_pos(disk, mod(get_pos(disk) + 1, 5), isSpace);
@@ -268,25 +357,31 @@ void go_360(int disk, uint8_t dir, bool isSpace) {
       set_target_pos(disk, mod(get_pos(disk) - 1, 5), isSpace);
     }
     while (!is_target(disk)) {
-      if (isStop || digitalRead(RED_BUTTON) == LOW) {
-        motor[0].run(RELEASE);
-        motor[1].run(RELEASE);
-        motor[2].run(RELEASE);
-        isStop = true;
-        isInitialized = false;
-        return;
-      }
+      checkStop();
     }
   }
-  motor[disk].run(RELEASE);
+  motor[disk].stopMotor();
+}
+
+bool checkStop() {
+  if (isStop || digitalRead(RED_BUTTON) == LOW) {
+    motor[0].stopMotor();
+    motor[1].stopMotor();
+    motor[2].stopMotor();
+    isStop = true;
+    isInitialized = false;
+    DUMPSLN("Stop Pressed!");
+    return true;
+  }
+  return false;
 }
 
 void go(int disk, uint8_t dir, int num, bool isSpace) {
   if (isStop) { return; }
 
-  DUMP("go(", disk);
-  DUMP(",", num);
-  DUMP(",", isSpace);
+  DUMP("go(disk=", disk);
+  DUMP(",num=", num);
+  DUMP(",isSpace=", isSpace);
   DUMPS(")\n");
 
   if (dir == FORWARD) {
@@ -297,6 +392,11 @@ void go(int disk, uint8_t dir, int num, bool isSpace) {
 }
 
 void go_to(int disk, uint8_t pos, bool isSpace) {
+  DUMP("go_to(disk=", disk);
+  DUMP(",pos=", pos);
+  DUMP(",isSpace=", isSpace);
+  DUMPS(")\n");
+
   if (isStop) { return; }
 
   set_target_pos(disk, pos, isSpace);
@@ -308,88 +408,57 @@ void go_to(int disk, uint8_t pos, bool isSpace) {
     dir = FORWARD;
   }
 
-  motor[disk].setSpeed(255);
-  runDisk(disk, dir);
+  //motor[disk].setSpeed(255);
+  runDisk(disk, dir, 255);
 
-  DUMP("go_to*", disk);
-  DUMP("*", dir);
-  DUMP("* (currentPos,targetPos) = (", get_abs_pos(disk));
+  DUMP("(currentPos,targetPos) = (", get_abs_pos(disk));
   DUMP(",", get_abs_target_pos(disk));
   DUMPS(")\n");
 
   while (!is_target(disk)) {
-    if (isStop || digitalRead(RED_BUTTON) == LOW) {
-      motor[0].run(RELEASE);
-      motor[1].run(RELEASE);
-      motor[2].run(RELEASE);
-      isStop = true;
-      isInitialized = false;
-      return;
-    }
+    if (checkStop()) return;
   }
 
   DUMPS("Reverse\n");
-
+  long speed = 0;
   add_abs_pos(disk, (dir == FORWARD) ? 1 : -1);
   if (dir == FORWARD) {
-    motor[disk].setSpeed(255);
+    speed = 255;
   } else {
-    motor[disk].setSpeed(180);
+    speed = 180;
   }
-  runDisk(disk, opposite_dir(dir));
+  runDisk(disk, opposite_dir(dir), speed);
 
   while (!is_target(disk)) {
-    if (isStop || digitalRead(RED_BUTTON) == LOW) {
-      motor[0].run(RELEASE);
-      motor[1].run(RELEASE);
-      motor[2].run(RELEASE);
-      isStop = true;
-      isInitialized = false;
-      return;
-    }
+    if (checkStop()) return;
   }
 
   DUMPS("Reverse Again\n");
-
+  speed = 0;
   add_abs_pos(disk, (dir == BACKWARD) ? 1 : -1);
   if (dir == FORWARD) {
-    motor[disk].setSpeed(180);
+    speed = 180;
   } else {
-    motor[disk].setSpeed(70);
+    speed = 120;
   }
-  runDisk(disk, dir);
+  runDisk(disk, dir, speed);
 
   while (!is_target(disk)) {
-    if (isStop || digitalRead(RED_BUTTON) == LOW) {
-      motor[0].run(RELEASE);
-      motor[1].run(RELEASE);
-      motor[2].run(RELEASE);
-      isStop = true;
-      isInitialized = false;
-      return;
-    }
+    if (checkStop()) return;
   }
 
   if (dir == FORWARD) {
     DUMPS("Reverse Again!!!\n");
 
     add_abs_pos(disk, 1);
-    motor[disk].setSpeed(70);
-    runDisk(disk, opposite_dir(dir));
+    runDisk(disk, opposite_dir(dir), 120);
 
     while (!is_target(disk)) {
-      if (isStop || digitalRead(RED_BUTTON) == LOW) {
-        motor[0].run(RELEASE);
-        motor[1].run(RELEASE);
-        motor[2].run(RELEASE);
-        isStop = true;
-        isInitialized = false;
-        return;
-      }
+      if (checkStop()) return;
     }
   }
 
-  motor[disk].run(RELEASE);
+  motor[disk].stopMotor();
 
   DUMPS("Done\n");
 }
@@ -423,19 +492,10 @@ void go_both(uint8_t pos, bool isSpace) {
 
   int numTop = 0;
   int numBot = 0;
-  motor[TOPDISK].setSpeed(255);
-  motor[BOTDISK].setSpeed(255);
-  runDisk(TOPDISK, dirTop);
-  runDisk(BOTDISK, dirBot);
+  runDisk(TOPDISK, dirTop, 255);
+  runDisk(BOTDISK, dirBot, 255);
   while (numTop < 4 || numBot < 4) {
-    if (isStop || digitalRead(RED_BUTTON) == LOW) {
-      motor[0].run(RELEASE);
-      motor[1].run(RELEASE);
-      motor[2].run(RELEASE);
-      isStop = true;
-      isInitialized = false;
-      return;
-    }
+    if (checkStop()) return;
 
     if (numTop < 4 && is_target(TOPDISK)) {
       numTop++;
@@ -447,33 +507,30 @@ void go_both(uint8_t pos, bool isSpace) {
           DUMPS("TOP Reverse\n");
           dir = opposite_dir(dirTop);
           add_abs_pos(TOPDISK, (dir == FORWARD) ? -1 : 1);
-          motor[TOPDISK].setSpeed(255);
-          runDisk(TOPDISK, dir);
+          runDisk(TOPDISK, dir, 255);
           break;
         case 2:
           DUMPS("TOP Reverse Again\n");
           dir = dirTop;
           add_abs_pos(TOPDISK, (dir == FORWARD) ? -1 : 1);
-          motor[TOPDISK].setSpeed(150);
-          runDisk(TOPDISK, dir);
+          runDisk(TOPDISK, dir, 150);
           break;
         case 3:
           if (dirTop == FORWARD) {
             DUMPS("TOP Reverse Again!!!\n");
             dir = opposite_dir(dirTop);
             add_abs_pos(TOPDISK, (dir == FORWARD) ? -1 : 1);
-            motor[TOPDISK].setSpeed(150);
-            runDisk(TOPDISK, dir);
+            runDisk(TOPDISK, dir, 150);
           } else {
             numTop++;
             DUMP("numTop:", numTop);
             DUMPS("\n");
-            motor[TOPDISK].run(RELEASE);
+            motor[TOPDISK].stopMotor();
             DUMPS("DoneTop\n");
           }
           break;
         default:
-          motor[TOPDISK].run(RELEASE);
+          motor[TOPDISK].stopMotor();
           DUMPS("DoneTop\n");
       }
     }
@@ -487,33 +544,30 @@ void go_both(uint8_t pos, bool isSpace) {
           DUMPS("BOT Reverse\n");
           dir = opposite_dir(dirBot);
           add_abs_pos(BOTDISK, (dir == FORWARD) ? -1 : 1);
-          motor[BOTDISK].setSpeed(255);
-          runDisk(BOTDISK, dir);
+          runDisk(BOTDISK, dir, 255);
           break;
         case 2:
           DUMPS("BOT Reverse Again\n");
           dir = dirBot;
           add_abs_pos(BOTDISK, (dir == FORWARD) ? -1 : 1);
-          motor[BOTDISK].setSpeed(150);
-          runDisk(BOTDISK, dir);
+          runDisk(BOTDISK, dir, 150);
           break;
         case 3:
           if (dirBot == FORWARD) {
             DUMPS("BOT Reverse Again!!!\n");
             dir = opposite_dir(dirBot);
             add_abs_pos(BOTDISK, (dir == FORWARD) ? -1 : 1);
-            motor[BOTDISK].setSpeed(150);
-            runDisk(BOTDISK, dir);
+            runDisk(BOTDISK, dir, 150);
           } else {
             numBot++;
             DUMP("numBot:", numBot);
             DUMPS("\n");
-            motor[BOTDISK].run(RELEASE);
+            motor[BOTDISK].stopMotor();
             Serial.println("DoneBot");
           }
           break;
         default:
-          motor[BOTDISK].run(RELEASE);
+          motor[BOTDISK].stopMotor();
           DUMPS("DoneBot\n");
       }
     }
@@ -525,28 +579,18 @@ void calibrate_positions() {
 
   go(TOPDISK, BACKWARD, 1, SPACE);
 
-  motor[BOTDISK].setSpeed(255);
-  runDisk(BOTDISK, BACKWARD);
+  runDisk(BOTDISK, BACKWARD, 255);
 
   uint32_t brightness_max = 0;
   int white_index = 0;
   for (int i = 0; i < 5; i++) {
     set_target_pos(BOTDISK, mod(get_pos(BOTDISK) - 1, 5), SPACE);
     while (!is_target(BOTDISK)) {
-      if (isStop || digitalRead(RED_BUTTON) == LOW) {
-        motor[0].run(RELEASE);
-        motor[1].run(RELEASE);
-        motor[2].run(RELEASE);
-        isStop = true;
-        isInitialized = false;
-        return;
-      }
+      if (checkStop()) return;
     }
 
-    CS.setFilter(TCS230_RGB_X);
-    CS.setEnable(true);
-    uint32_t brightness = CS.readSingle();
-    CS.setEnable(false);
+    uint32_t brightness = readClearChannel();
+
     DUMP("Brightness is: ", brightness);
     DUMPS("\n");
     if (brightness > brightness_max) {
@@ -554,9 +598,9 @@ void calibrate_positions() {
       white_index = i;
     }
   }
-  motor[BOTDISK].run(RELEASE);
+  motor[BOTDISK].stopMotor();
 
-  go(BOTDISK, BACKWARD, mod(white_index, 5), SPACE);
+  go(BOTDISK, BACKWARD, mod(white_index, NUM_COLORS), SPACE);
   go(TOPDISK, BACKWARD, 1, HOLE);
 
   if (!isStop) {
@@ -566,38 +610,59 @@ void calibrate_positions() {
   }
 }
 
+uint8_t readClearChannel() {
+  uint8_t red, green, blue, clear;
+  //clear interrupt to get the latest color
+  colorint = false;
+  tcs.clearInterrupt();
+  while (!colorint) { 
+  };
+  getRawData_noDelay(&red, &green, &blue, &clear);
+
+  return clear;
+}
+
 
 void calibrate_color() {
+  uint8_t r, g, b;
+  DUMPSLN("calibrate_color");
   if (isStop) { return; }
-
-  sensorData sd;
 
   // Put this on a hole to clear old skittles
   go(BOTDISK, BACKWARD, 1, HOLE);
 
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < NUM_COLORS; i++) {
     go(TOPDISK, BACKWARD, 1, HOLE);
-    CS.read();
-    while (!CS.available()) {
-      if (isStop || digitalRead(RED_BUTTON) == LOW) {
-        motor[0].run(RELEASE);
-        motor[1].run(RELEASE);
-        motor[2].run(RELEASE);
-        isStop = true;
-        isInitialized = false;
-        return;
-      }
+    //clear interrupt to get the latest color
+    colorint = false;
+    tcs.clearInterrupt();
+
+    //wait for interrupt
+    while (!colorint) {
+      if (checkStop()) return;
     };
-    CS.getRaw(&sd);
-    skittles[i][0] = sd.value[TCS230_RGB_R];
-    skittles[i][1] = sd.value[TCS230_RGB_G];
-    skittles[i][2] = sd.value[TCS230_RGB_B];
+    //get color
+    getRGBNormalized(&r,&g,&b);
+    skittles[i][0] = r;
+    skittles[i][1] = g;
+    skittles[i][2] = b;
   }
 }
 
-void runDisk(int disk, uint8_t dir) {
+void runDisk(int disk, uint8_t dir, long speed) {
+  DUMP("runDisk(disk=", disk);
+  DUMP(",dir=", dir);
+  DUMP(",speed=", speed);
+  DUMPS(")\n");
+
   diskDir[disk] = dir;
-  motor[disk].run(dir);
+  if (dir == FORWARD){
+    speed = abs(speed);
+  }
+  if (dir == BACKWARD){
+    speed = speed * -1;
+  }
+  motor[disk].motorGo(speed);
 }
 
 uint8_t opposite_dir(uint8_t dir) {
@@ -616,17 +681,21 @@ long mod(long a, long b) {
 // Color Functions
 ////////////////////
 
-int getColor(sensorData sd) {
+int getColor(uint8_t r, uint8_t g, uint8_t b) {
   int lowest_distance = 9999;
   int color_num;
 
+  DUMP("getColor(r=",r);
+  DUMP(",g=", g);
+  DUMP(",b=", b);
+  DUMPS(")\n");
+
   for (int i = 0; i < NUM_COLORS; i++) {
 
-    int d = sqrt(sq(sd.value[0] - skittles[i][0]) + sq(sd.value[1] - skittles[i][1]) + sq(sd.value[2] - skittles[i][2]));
-    Serial.print("distance for color ");
-    Serial.print(i);
-    Serial.print(" is ");
-    Serial.println(d);
+    int d = sqrt(sq(r - skittles[i][0]) + sq(g - skittles[i][1]) + sq(b - skittles[i][2]));
+    DUMP("distance for color ", i);
+    DUMP(" is ", d);
+    DUMPS("\n");
 
     if (d < lowest_distance) {
       lowest_distance = d;
@@ -641,35 +710,54 @@ int getColor(sensorData sd) {
 }
 
 int readColor() {
-  sensorData sd;
-  colorData rgb;
+  uint8_t r,g,b;
 
-  CS.read();
-  while (!CS.available()) {};
-  CS.getRaw(&sd);
-  printRaw(sd);
+  //reset interupt
+  colorint = false;
+  tcs.clearInterrupt();
 
-  return getColor(sd);
+  while (!colorint) {};
+  getRGBNormalized(&r,&g,&b);
+  printRGB(r,g,b);
+
+  return getColor(r,g,b);
 }
 
-void printRGB(colorData rgb) {
-  Serial.println("");
-  Serial.print("RGB is [");
-  Serial.print(rgb.value[TCS230_RGB_R]);
-  Serial.print(",");
-  Serial.print(rgb.value[TCS230_RGB_G]);
-  Serial.print(",");
-  Serial.print(rgb.value[TCS230_RGB_B]);
-  Serial.println("]");
+void printRGB(uint8_t r, uint8_t g, uint8_t b) {
+  DUMPS("\n");
+  DUMP("Raw is [", r);
+  DUMP(",", g);
+  DUMP(",", b);
+  DUMPS("]\n");
 }
 
-void printRaw(sensorData sd) {
-  Serial.println("");
-  Serial.print("Raw is [");
-  Serial.print(sd.value[TCS230_RGB_R]);
-  Serial.print(",");
-  Serial.print(sd.value[TCS230_RGB_G]);
-  Serial.print(",");
-  Serial.print(sd.value[TCS230_RGB_B]);
-  Serial.println("]");
+ISR (PCINT2_vect) {
+ // DUMPBIN("PCINT2 INT:", PIND);
+ // DUMPSLN("");
+  //detect only changes
+  uint8_t currentValue = PIND ^ prevValue;
+  if (currentValue & 0b00010000) {
+    //topint = true; //D2
+    //DUMPSLN("Top Interrupt");
+    top_pos_handler();
+  }
+  if (currentValue & 0b00000100) {
+    //botint = true; //D4
+    //DUMPSLN("Bottom Interrupt");
+    bot_pos_handler();
+  }
+  prevValue = PIND;
 }
+
+ISR (PCINT1_vect) {
+  //DUMPBIN("PCINT1 INT:", PINC);
+  //DUMPSLN("");  
+  colorint = true;
+  if (PINC & 0b00000100){
+    //DUMPSLN("Color Interrupt");
+  }
+  else{
+    //Serial.println(F("Other CInt"));
+  }
+}
+
