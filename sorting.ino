@@ -12,12 +12,12 @@ volatile uint8_t prevValue = 0;
 
 
 #define NUM_MOTORS 3
-#define B_PINA 3
-#define B_PINB 5
+#define B_PINA 5
+#define B_PINB 3
 #define C_PINA 6
 #define C_PINB 9
-#define A_PINA 10
-#define A_PINB 11
+#define A_PINA 11
+#define A_PINB 10
 MX1508 motor[NUM_MOTORS] = {
   MX1508(A_PINA, A_PINB),
   MX1508(B_PINA, B_PINB),
@@ -40,6 +40,11 @@ MX1508 motor[NUM_MOTORS] = {
     Serial.print(F(s)); \
     Serial.print(v,BIN); \
   }  
+#define DUMPDEC(s, v) \
+  { \
+    Serial.print(F(s)); \
+    Serial.print(v,DEC); \
+  }    
 #define DUMPS(s) Serial.print(F(s))
 #define DUMPSLN(s) Serial.println(F(s))
 #else
@@ -96,17 +101,22 @@ bool isInitialized = false;
 
 /* tcs.getRawData() does a delay(Integration_Time) after the sensor readout.
 We don't need to wait for the next integration cycle because we receive an interrupt when the integration cycle is complete*/
-void getRawData_noDelay(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *c)
+void getRawData_noDelay(uint16_t *r, uint16_t *g, uint16_t *b, uint16_t *c)
 {
-  *c = tcs.read8(TCS34725_CDATAL);
-  *r = tcs.read8(TCS34725_RDATAL);
-  *g = tcs.read8(TCS34725_GDATAL);
-  *b = tcs.read8(TCS34725_BDATAL);
+  *c = tcs.read16(TCS34725_CDATAL);
+  *r = tcs.read16(TCS34725_RDATAL);
+  *g = tcs.read16(TCS34725_GDATAL);
+  *b = tcs.read16(TCS34725_BDATAL);
+  DUMPDEC("crgb:",*c);
+  DUMPDEC(",",*r);
+  DUMPDEC(",",*g);
+  DUMPDEC(",",*b);
+  DUMPSLN("");
 }
 
-void getRGBNormalized(uint8_t *r, uint8_t *g, uint8_t *b)
+void getRGBNormalized(float *r, float *g, float *b)
 {
-  uint8_t red, green, blue, clear;
+  uint16_t red, green, blue, clear;
   getRawData_noDelay(&red, &green, &blue, &clear);
 
   uint32_t sum = clear;
@@ -128,7 +138,9 @@ void set_abs_pos(uint8_t disk, uint8_t pos) {
 }
 
 void set_pos(uint8_t disk, uint8_t pos, bool isSpace) {
-  diskPos[disk] = 2 * pos + isSpace;
+  int idx = 0;
+  isSpace ? idx = 1 : idx = 0;
+  diskPos[disk] = 2 * pos + idx;
 }
 
 uint8_t get_abs_pos(uint8_t disk) {
@@ -152,7 +164,9 @@ void set_abs_target_pos(uint8_t disk, uint8_t pos) {
 }
 
 void set_target_pos(uint8_t disk, uint8_t pos, bool isSpace) {
-  targetPos[disk] = 2 * pos + isSpace;
+  int idx = 0;
+  isSpace ? idx = 1 : idx = 0;  
+  targetPos[disk] = 2 * pos + idx;
 }
 
 uint8_t get_abs_target_pos(uint8_t disk) {
@@ -176,10 +190,9 @@ bool is_target(uint8_t disk) {
 }
 
 void top_pos_handler() {
-  DUMPSLN("top_pos_handler");
+  //DUMPSLN("top_pos_handler");
   int value = digitalRead(TOPDISK_PIN);
-
-  if (value) {
+  if (!value) {
     if ((diskDir[TOPDISK] == BACKWARD) && is_space(TOPDISK)) {
       add_abs_pos(TOPDISK, -1);
     } else if ((diskDir[TOPDISK] == FORWARD) && !is_space(TOPDISK)) {
@@ -192,13 +205,14 @@ void top_pos_handler() {
       add_abs_pos(TOPDISK, 1);
     }
   }
+  DUMP("TopPos:", get_abs_pos(TOPDISK));
+  DUMPSLN("");  
 }
 
 void bot_pos_handler() {
-  DUMPSLN("bot_pos_handler");
+  //DUMPSLN("bot_pos_handler");
   int value = digitalRead(BOTDISK_PIN);
-
-  if (value) {
+  if (!value) {
     if ((diskDir[BOTDISK] == BACKWARD) && is_space(BOTDISK)) {
       add_abs_pos(BOTDISK, -1);
     } else if ((diskDir[BOTDISK] == FORWARD) && !is_space(BOTDISK)) {
@@ -211,6 +225,8 @@ void bot_pos_handler() {
       add_abs_pos(BOTDISK, 1);
     }
   }
+  DUMP("BotPos:", get_abs_pos(BOTDISK));
+  DUMPSLN("");
 }
 
 
@@ -254,6 +270,9 @@ void setup() {
 
   delay(100);
 
+  tcs.clearInterrupt();
+  colorint = false;
+
 }
 void tripOff(){
   //turn off tripwire led
@@ -278,11 +297,10 @@ void loop() {
 
   if (!isInitialized) {
     DUMPSLN("Initializing...");
-    calibrate_color();    
+    calibrate_color();      
     calibrate_positions();
     DUMPSLN("Initialization Complete!");
   }
-
   drop_skittle();
   move_to_color_sensor();
   int index = readColor();
@@ -317,7 +335,7 @@ void drop_skittle() {
 
   // Wait for Skittle
   unsigned long startTime = millis();
-  DUMP("TRIP:", analogRead(TRIPWIRE_PIN));
+  //DUMP("TRIP:", analogRead(TRIPWIRE_PIN));
   DUMPSLN("");
   while (analogRead(TRIPWIRE_PIN) > 1200) {
     if (millis() > startTime + 5000) {
@@ -379,7 +397,8 @@ bool checkStop() {
 void go(int disk, uint8_t dir, int num, bool isSpace) {
   if (isStop) { return; }
 
-  DUMP("go(disk=", disk);
+  DUMP("go(", disk==TOPDISK ? "TOPDISK" : "BOTDISK");
+  DUMP(",", dir==FORWARD ? "FORWARD": "BACKWARD");  
   DUMP(",num=", num);
   DUMP(",isSpace=", isSpace);
   DUMPS(")\n");
@@ -392,7 +411,7 @@ void go(int disk, uint8_t dir, int num, bool isSpace) {
 }
 
 void go_to(int disk, uint8_t pos, bool isSpace) {
-  DUMP("go_to(disk=", disk);
+  DUMP("go_to(", disk==TOPDISK ? "TOPDISK" : "BOTDISK");
   DUMP(",pos=", pos);
   DUMP(",isSpace=", isSpace);
   DUMPS(")\n");
@@ -423,7 +442,7 @@ void go_to(int disk, uint8_t pos, bool isSpace) {
   long speed = 0;
   add_abs_pos(disk, (dir == FORWARD) ? 1 : -1);
   if (dir == FORWARD) {
-    speed = 255;
+    speed = 180;
   } else {
     speed = 180;
   }
@@ -437,7 +456,7 @@ void go_to(int disk, uint8_t pos, bool isSpace) {
   speed = 0;
   add_abs_pos(disk, (dir == BACKWARD) ? 1 : -1);
   if (dir == FORWARD) {
-    speed = 180;
+    speed = 120;
   } else {
     speed = 120;
   }
@@ -451,7 +470,7 @@ void go_to(int disk, uint8_t pos, bool isSpace) {
     DUMPS("Reverse Again!!!\n");
 
     add_abs_pos(disk, 1);
-    runDisk(disk, opposite_dir(dir), 120);
+    runDisk(disk, opposite_dir(dir), 100);
 
     while (!is_target(disk)) {
       if (checkStop()) return;
@@ -465,7 +484,9 @@ void go_to(int disk, uint8_t pos, bool isSpace) {
 
 void go_both(uint8_t pos, bool isSpace) {
   if (isStop) { return; }
-
+  DUMP("go_both(pos", pos);
+  DUMP(",isSpace=",isSpace);
+  DUMPSLN(")");
   set_target_pos(TOPDISK, pos, isSpace);
   set_target_pos(BOTDISK, pos, isSpace);
 
@@ -481,11 +502,11 @@ void go_both(uint8_t pos, bool isSpace) {
     dirBot = FORWARD;
   }
 
-  DUMP("go_both*", dirTop);
+  DUMP("go_both *", dirTop);
   DUMP("*", dirBot);
   DUMP("* (currPosTop,curPosBot) = (", get_abs_pos(TOPDISK));
   DUMP(",", get_abs_pos(BOTDISK));
-  DUMP(")  (targetPosTop,targetPosBot) = (", get_abs_target_pos(TOPDISK));
+  DUMP(") -> (targetPosTop,targetPosBot) = (", get_abs_target_pos(TOPDISK));
   DUMP(",", get_abs_target_pos(BOTDISK));
   DUMPS(")\n");
 
@@ -507,20 +528,20 @@ void go_both(uint8_t pos, bool isSpace) {
           DUMPS("TOP Reverse\n");
           dir = opposite_dir(dirTop);
           add_abs_pos(TOPDISK, (dir == FORWARD) ? -1 : 1);
-          runDisk(TOPDISK, dir, 255);
+          runDisk(TOPDISK, dir, 180);
           break;
         case 2:
           DUMPS("TOP Reverse Again\n");
           dir = dirTop;
           add_abs_pos(TOPDISK, (dir == FORWARD) ? -1 : 1);
-          runDisk(TOPDISK, dir, 150);
+          runDisk(TOPDISK, dir, 100);
           break;
         case 3:
           if (dirTop == FORWARD) {
             DUMPS("TOP Reverse Again!!!\n");
             dir = opposite_dir(dirTop);
             add_abs_pos(TOPDISK, (dir == FORWARD) ? -1 : 1);
-            runDisk(TOPDISK, dir, 150);
+            runDisk(TOPDISK, dir, 100);
           } else {
             numTop++;
             DUMP("numTop:", numTop);
@@ -544,20 +565,20 @@ void go_both(uint8_t pos, bool isSpace) {
           DUMPS("BOT Reverse\n");
           dir = opposite_dir(dirBot);
           add_abs_pos(BOTDISK, (dir == FORWARD) ? -1 : 1);
-          runDisk(BOTDISK, dir, 255);
+          runDisk(BOTDISK, dir, 180);
           break;
         case 2:
           DUMPS("BOT Reverse Again\n");
           dir = dirBot;
           add_abs_pos(BOTDISK, (dir == FORWARD) ? -1 : 1);
-          runDisk(BOTDISK, dir, 150);
+          runDisk(BOTDISK, dir, 100);
           break;
         case 3:
           if (dirBot == FORWARD) {
             DUMPS("BOT Reverse Again!!!\n");
             dir = opposite_dir(dirBot);
             add_abs_pos(BOTDISK, (dir == FORWARD) ? -1 : 1);
-            runDisk(BOTDISK, dir, 150);
+            runDisk(BOTDISK, dir, 100);
           } else {
             numBot++;
             DUMP("numBot:", numBot);
@@ -574,35 +595,41 @@ void go_both(uint8_t pos, bool isSpace) {
   }
 }
 
+void pause(){
+  while(true) // remain here until told to break
+  {
+    if(Serial.available() > 0) // did something come in?
+      if(Serial.read() == 'c') // is that something the char c?
+        break;
+  }
+}
+
 void calibrate_positions() {
   if (isStop) { return; }
-
+  DUMPSLN("calibrate_positions");
   go(TOPDISK, BACKWARD, 1, SPACE);
-
-  runDisk(BOTDISK, BACKWARD, 255);
-
-  uint32_t brightness_max = 0;
+  uint32_t brightness_min = 9999;
   int white_index = 0;
-  for (int i = 0; i < 5; i++) {
+  
+  for (int i = 0; i < NUM_COLORS; i++) {
     set_target_pos(BOTDISK, mod(get_pos(BOTDISK) - 1, 5), SPACE);
+    go(BOTDISK, BACKWARD, 1, SPACE);
     while (!is_target(BOTDISK)) {
       if (checkStop()) return;
     }
-
+    motor[BOTDISK].stopMotor();
     uint32_t brightness = readClearChannel();
-
     DUMP("Brightness is: ", brightness);
     DUMPS("\n");
-    if (brightness > brightness_max) {
-      brightness_max = brightness;
+    if (brightness < brightness_min) {
+      brightness_min = brightness;
       white_index = i;
     }
   }
   motor[BOTDISK].stopMotor();
-
   go(BOTDISK, BACKWARD, mod(white_index, NUM_COLORS), SPACE);
   go(TOPDISK, BACKWARD, 1, HOLE);
-
+  delay(100);
   if (!isStop) {
     set_abs_pos(TOPDISK, 8);
     set_abs_pos(BOTDISK, 9);
@@ -610,11 +637,11 @@ void calibrate_positions() {
   }
 }
 
-uint8_t readClearChannel() {
-  uint8_t red, green, blue, clear;
+uint16_t readClearChannel() {
+  uint16_t red, green, blue, clear;
   //clear interrupt to get the latest color
-  colorint = false;
   tcs.clearInterrupt();
+  colorint = false;
   while (!colorint) { 
   };
   getRawData_noDelay(&red, &green, &blue, &clear);
@@ -624,7 +651,7 @@ uint8_t readClearChannel() {
 
 
 void calibrate_color() {
-  uint8_t r, g, b;
+  float fr, fg, fb;
   DUMPSLN("calibrate_color");
   if (isStop) { return; }
 
@@ -634,24 +661,34 @@ void calibrate_color() {
   for (int i = 0; i < NUM_COLORS; i++) {
     go(TOPDISK, BACKWARD, 1, HOLE);
     //clear interrupt to get the latest color
-    colorint = false;
     tcs.clearInterrupt();
+    colorint = false;
 
     //wait for interrupt
     while (!colorint) {
       if (checkStop()) return;
+      //DUMPSLN("waiting for color");
     };
+
     //get color
-    getRGBNormalized(&r,&g,&b);
-    skittles[i][0] = r;
-    skittles[i][1] = g;
-    skittles[i][2] = b;
+    getRGBNormalized(&fr,&fg,&fb);
+    skittles[i][0] = int(fr);
+    skittles[i][1] = int(fg);
+    skittles[i][2] = int(fb);
+  }
+  DUMPSLN("Reference Colors:");
+  for (int i = 0; i < NUM_COLORS; i++){
+    DUMP("Pos",i);
+    DUMPDEC(": [",skittles[i][0]);
+    DUMPDEC(",",skittles[i][1]);
+    DUMPDEC(",",skittles[i][2]);
+    DUMPSLN("]");
   }
 }
 
 void runDisk(int disk, uint8_t dir, long speed) {
-  DUMP("runDisk(disk=", disk);
-  DUMP(",dir=", dir);
+  DUMP("runDisk(", disk==TOPDISK ? "TOPDISK" : "BOTDISK");
+  DUMP(",", dir==FORWARD ? "FORWARD": "BACKWARD");
   DUMP(",speed=", speed);
   DUMPS(")\n");
 
@@ -662,6 +699,8 @@ void runDisk(int disk, uint8_t dir, long speed) {
   if (dir == BACKWARD){
     speed = speed * -1;
   }
+  DUMP("Raw speed:", speed);
+  DUMPSLN("");
   motor[disk].motorGo(speed);
 }
 
@@ -681,7 +720,7 @@ long mod(long a, long b) {
 // Color Functions
 ////////////////////
 
-int getColor(uint8_t r, uint8_t g, uint8_t b) {
+int getColor(float r, float g, float b) {
   int lowest_distance = 9999;
   int color_num;
 
@@ -710,24 +749,24 @@ int getColor(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 int readColor() {
-  uint8_t r,g,b;
+  float fr,fg,fb;
 
   //reset interupt
-  colorint = false;
   tcs.clearInterrupt();
+  colorint = false;
 
   while (!colorint) {};
-  getRGBNormalized(&r,&g,&b);
-  printRGB(r,g,b);
+  getRGBNormalized(&fr,&fg,&fb);
+  printRGB(fr,fg,fb);
 
-  return getColor(r,g,b);
+  return getColor(fr,fg,fb);
 }
 
 void printRGB(uint8_t r, uint8_t g, uint8_t b) {
   DUMPS("\n");
-  DUMP("Raw is [", r);
-  DUMP(",", g);
-  DUMP(",", b);
+  DUMPDEC("Raw is [", r);
+  DUMPDEC(",", g);
+  DUMPDEC(",", b);
   DUMPS("]\n");
 }
 
